@@ -1,0 +1,45 @@
+# Build outputs
+build/
+out/
+dist/
+bin/
+obj/
+Debug/
+Release/
+
+# Test binaries
+tests/test_all
+tests/test_all.exe
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Coverage and analysis
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# CMake and generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Editor and IDE
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+
+# OS files
+.DS_Store
+Thumbs.db
+git.txt

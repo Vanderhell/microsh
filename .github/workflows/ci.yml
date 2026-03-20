@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            compiler: gcc
+            package: gcc
+          - name: clang
+            compiler: clang
+            package: clang
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make ${{ matrix.package }}
+
+      - name: Build tests
+        working-directory: tests
+        shell: bash
+        run: make clean && make CC=${{ matrix.compiler }}
+
+      - name: Run tests
+        working-directory: tests
+        shell: bash
+        run: ./test_all
