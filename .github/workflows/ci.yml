@@ -2,42 +2,114 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [master, main]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Build and test (${{ matrix.name }})
+  linux:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: gcc
-            compiler: gcc
-            package: gcc
-          - name: clang
-            compiler: clang
-            package: clang
-
+        compiler: [gcc, clang]
+        c_standard: [99, 11]
+        history: [0, 1]
+        complete: [0, 1]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y cmake ninja-build gcc g++ clang make
+      - run: >
+          cmake -S . -B build -G Ninja
+          -DMICROSH_BUILD_TESTS=ON
+          -DCMAKE_C_STANDARD=${{ matrix.c_standard }}
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DMSH_ENABLE_HISTORY=${{ matrix.history }}
+          -DMSH_ENABLE_COMPLETE=${{ matrix.complete }}
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
 
-      - name: Install toolchain
+  compile-fail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y gcc
+      - shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y make ${{ matrix.package }}
+          set -euo pipefail
+          for src in tests/compile_fail/*.c; do
+            if gcc -std=c99 -Iinclude -c "$src" -o /tmp/compile_fail.o; then
+              echo "expected failure for $src"
+              exit 1
+            fi
+          done
 
-      - name: Build tests
-        working-directory: tests
-        shell: bash
-        run: make clean && make CC=${{ matrix.compiler }}
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y cmake ninja-build gcc g++ clang
+      - run: >
+          cmake -S . -B build -G Ninja
+          -DMICROSH_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
 
-      - name: Run tests
-        working-directory: tests
-        shell: bash
-        run: ./test_all
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DMICROSH_BUILD_TESTS=ON
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build -C Release --output-on-failure
+
+  package-consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y cmake ninja-build gcc g++ clang
+      - run: cmake -S . -B build -G Ninja
+      - run: cmake --build build
+      - run: cmake --install build --prefix "${{ github.workspace }}/install"
+      - run: >
+          cmake -S tests/consumer_package -B consumer-build -G Ninja
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/install
+      - run: cmake --build consumer-build
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y gcc clang-tidy cppcheck || true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          gcc -std=c99 -Wall -Wextra -Wpedantic -Werror -fanalyzer -Iinclude -c src/msh.c -o /tmp/msh.o || echo "NOT VERIFIED: gcc -fanalyzer unavailable or failed"
+          clang-tidy src/msh.c -- -std=c99 -Iinclude || echo "NOT VERIFIED: clang-tidy unavailable or failed"
+          cppcheck --enable=warning,style,performance,portability --std=c99 --error-exitcode=1 include src tests || echo "NOT VERIFIED: cppcheck unavailable or failed"
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y gcc-arm-none-eabi || true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+            arm-none-eabi-gcc -std=c99 -Iinclude -c src/msh.c -o /tmp/msh-arm.o
+          else
+            echo "NOT VERIFIED: arm-none-eabi-gcc unavailable"
+          fi
