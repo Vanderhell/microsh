@@ -1,48 +1,52 @@
-# Design Rationale
+# Design
 
-## 1. Character-by-character input
+## Goals
 
-Decision: `msh_feed()` processes one byte at a time instead of receiving full lines.
+- Strict C99 implementation
+- Fixed-size state and zero dynamic allocation
+- Small API surface
+- Deterministic memory use
 
-Why: UART interfaces naturally deliver bytes incrementally. Handling input at byte granularity allows line editing, history navigation, and tab completion without requiring the application to build a separate line buffer first.
+## Input Model
 
-## 2. Static command table
+`msh_feed()` owns one caller-provided `msh_t` line buffer and processes one byte at a time. Editing is intentionally limited to ASCII printable bytes and a small CSI subset:
 
-Decision: Commands are stored in a fixed-size array.
+- `ESC [ A`, `B`, `C`, `D`
+- `ESC [ 3 ~`
 
-Why: This keeps the implementation deterministic, allocation-free, and small. For the intended command counts, linear lookup is acceptable and simpler than dynamic structures.
+This is enough for common ANSI/VT100-style serial terminals without attempting to implement a full terminal emulator.
 
-## 3. `argc/argv` command interface
+## Parsing Model
 
-Decision: Command handlers use `(int argc, const char **argv, void *ctx)`.
+The parser splits on spaces and tabs, preserves empty quoted arguments, and rejects:
 
-Why: The shape is familiar to C developers, supports subcommands naturally, and keeps the public API minimal.
+- too many tokens
+- unterminated quotes
+- non-whitespace immediately after a closing quote
 
-## 4. Built-in help registration
+There is no shell expansion, escaping, globbing, pipeline, redirection, scripting, or variable interpolation.
 
-Decision: `msh_init()` automatically registers a `help` command.
+## Ownership Model
 
-Why: Every shell benefits from discoverability. Auto-registering help keeps the developer experience consistent and avoids documentation drift between code and command listings.
+- `msh_t` is caller-owned
+- shell `ctx` is caller-owned
+- prompt is caller-owned
+- command names and help strings are caller-owned
+- command argv storage is temporary borrowed storage during a handler call
 
-## 5. History and completion as compile-time features
+## Execution Context Limits
 
-Decision: History and tab completion are enabled by default, but can be disabled with `MSH_ENABLE_HISTORY=0` and `MSH_ENABLE_COMPLETE=0`.
+- One `msh_t` instance must be owned by one execution context at a time.
+- Shared-instance concurrency requires external synchronization.
+- Recursive `msh_feed()` on the same instance from a print callback or handler is unsupported.
+- ISR handlers should enqueue bytes and let the owning task or main loop call `msh_feed()`.
 
-Why: These features are useful on most targets, but some constrained systems may need the RAM back. Compile-time switches remove both storage and code paths.
+## Standard Library Requirements
 
-## 6. Quoted string support
+`microsh` uses only standard C library facilities already typical in embedded or hosted C environments:
 
-Decision: Double-quoted spans are parsed as a single argument.
+- `memcmp`/`memcpy`/`memset`-style byte operations via `<string.h>`
+- `strcmp`/`strncmp`/`strchr`/`strlen`
+- `snprintf`
 
-Why: Embedded configuration values often contain spaces, such as SSIDs or labels. Quoted parsing improves usability without introducing a heavy parser.
-
-## Summary
-
-| Decision | Gains | Costs |
-|----------|-------|-------|
-| Byte-wise input | Real-time editing and immediate processing | Slightly more stateful implementation |
-| Static command table | Deterministic memory and zero allocation | Fixed command capacity |
-| `argc/argv` API | Familiar and flexible | No typed argument schema |
-| Auto `help` | Better discoverability | Consumes one command slot |
-| Compile-time features | Easy RAM and code-size trimming | Requires rebuild to change behavior |
-| Quoted strings | Better UX for values with spaces | Slightly more parsing logic |
+There are no third-party runtime dependencies.

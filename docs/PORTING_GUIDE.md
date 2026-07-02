@@ -1,105 +1,45 @@
 # Porting Guide
 
-`microsh` needs `msh.h`, `msh.c`, a C99 compiler, and one output callback.
+## Requirements
 
-## Platform Recipes
+- A strict C99 compiler
+- `<string.h>` functions used by the implementation
+- `snprintf`
+- A caller-supplied output function
 
-### STM32 HAL
+## Serial Integration
 
-```c
-static void uart_print(const char *str, void *ctx) {
-    (void)ctx;
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
-}
+### Correct pattern
 
-static msh_t shell;
+1. Receive bytes from UART, RTT, USB CDC, or another byte stream.
+2. If reception happens in an ISR, push bytes into a caller-owned queue or ring buffer.
+3. Drain that queue from the shell-owning main loop or task.
+4. Call `msh_feed()` from that one execution context.
 
-void shell_init(void) {
-    msh_init(&shell, uart_print, NULL);
-    msh_register(&shell, "reboot", "Restart", cmd_reboot);
-    msh_prompt(&shell);
-}
+### Incorrect pattern
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    msh_feed(&shell, rx_byte);
-    HAL_UART_Receive_IT(huart, &rx_byte, 1);
-}
-```
+Calling `msh_feed()` directly from an ISR, or from multiple unsynchronized contexts, is unsupported.
 
-### ESP32 UART
+## Feature Combinations
 
-```c
-static void esp_print(const char *str, void *ctx) {
-    (void)ctx;
-    uart_write_bytes(UART_NUM_0, str, strlen(str));
-}
+Supported build combinations:
 
-void shell_task(void *param) {
-    msh_t shell;
-    msh_init(&shell, esp_print, NULL);
-    msh_prompt(&shell);
+- history off, completion off
+- history on, completion off
+- history off, completion on
+- history on, completion on
 
-    uint8_t c;
-    while (1) {
-        if (uart_read_bytes(UART_NUM_0, &c, 1, portMAX_DELAY) == 1) {
-            msh_feed(&shell, (char)c);
-        }
-    }
-}
-```
-
-### Segger RTT
-
-```c
-#include "SEGGER_RTT.h"
-
-static void rtt_print(const char *str, void *ctx) {
-    (void)ctx;
-    SEGGER_RTT_WriteString(0, str);
-}
-
-while (1) {
-    char c;
-    if (SEGGER_RTT_Read(0, &c, 1) == 1) {
-        msh_feed(&shell, c);
-    }
-}
-```
-
-### Linux / POSIX
-
-```c
-#include <stdio.h>
-
-static void stdout_print(const char *str, void *ctx) {
-    (void)ctx;
-    fputs(str, stdout);
-    fflush(stdout);
-}
-
-while (1) {
-    char c = getchar();
-    msh_feed(&shell, c);
-}
-```
-
-## CMake Example
+## CMake Consumer
 
 ```cmake
-add_library(microsh STATIC src/msh.c)
-target_include_directories(microsh PUBLIC include)
+find_package(microsh CONFIG REQUIRED)
 
-target_compile_definitions(microsh PUBLIC
-    MSH_ENABLE_HISTORY=0
-    MSH_ENABLE_COMPLETE=0
-    MSH_MAX_COMMANDS=8
-)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE microsh::microsh)
 ```
 
-## Integration Checklist
+The exported CMake target propagates ABI-affecting compile definitions as `PUBLIC` usage requirements so downstream translation units use the same `msh_t` layout as the library.
 
-1. Use a C99-capable compiler.
-2. Provide an output callback for your transport.
-3. Forward incoming bytes to `msh_feed()`.
-4. Tune compile-time macros if RAM is constrained.
-5. If input arrives in an ISR, drain it from one consumer context.
+## C++ Consumer
+
+The public header is C++-compatible. Compile `src/msh.c` as C and link it into a C++ consumer; C++ support here means header compatibility and link compatibility, not compiling the implementation itself as C++.

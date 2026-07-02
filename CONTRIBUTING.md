@@ -1,9 +1,28 @@
-# Contributing to microsh
+# Contributing
 
-In scope: bug fixes, documentation, test coverage, platform recipes.
-Out of scope: dynamic allocation, scripting languages, external dependencies.
+## Scope
 
-1. Open an issue. 2. Fork, branch, write tests. 3. Submit PR.
-All tests must pass with `-Wall -Wextra -Wpedantic -Werror`.
+In scope:
 
-By contributing, you agree to the MIT License.
+- bug fixes
+- tests
+- documentation
+- packaging and CI improvements
+
+Out of scope:
+
+- dynamic allocation
+- scripting layers
+- dynamic command storage
+- threads or RTOS-specific synchronization inside the library
+- filesystem, networking, authentication, or logging frameworks
+- package-manager coupling
+- cleanup/defer abstractions unrelated to the shell
+
+## Rules
+
+- Keep the implementation strict C99.
+- Preserve zero dynamic allocation.
+- Do not weaken tests to hide regressions.
+- Do not claim verification that has not been run.
+- Do not create tags or releases unless explicitly requested.

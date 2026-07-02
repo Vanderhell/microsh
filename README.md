@@ -2,192 +2,101 @@
 
 [![CI](https://github.com/Vanderhell/microsh/actions/workflows/ci.yml/badge.svg)](https://github.com/Vanderhell/microsh/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![C99](https://img.shields.io/badge/language-C99-blue.svg)
-![Embedded](https://img.shields.io/badge/target-embedded%20systems-orange.svg)
-![Zero allocation](https://img.shields.io/badge/memory-zero%20allocation-brightgreen.svg)
-![No dependencies](https://img.shields.io/badge/dependencies-none-lightgrey.svg)
 
-Minimal debug shell for embedded systems.
+`microsh` is a small embedded shell library for byte-stream consoles such as UART, RTT, USB CDC, and test harnesses. It is written in strict C99, uses no dynamic allocation, and has no third-party runtime dependencies.
 
-`microsh` is a small C99 shell library for UART, RTT, USB CDC, or any byte-stream console. It is designed for firmware teams that need interactive inspection and control without dynamic allocation, external dependencies, or heavyweight command frameworks.
+The current repository state is documented in [docs/VERIFICATION.md](docs/VERIFICATION.md). Releases are tag-based only; see [CHANGELOG.md](CHANGELOG.md) and [.github/workflows/release.yml](.github/workflows/release.yml).
 
 ## Highlights
 
-- Register commands with a name, help text, and handler callback.
-- Parse `argc/argv` style arguments, including quoted strings.
-- Handle character-by-character input with line editing.
-- Support command history and tab completion without heap allocation.
-- Fit embedded workflows: deterministic memory, portable C99, UART-friendly.
-- Include tests and documentation for API, design decisions, and porting.
+- Fixed-size command table with built-in `help`
+- `argc`/`argv` command handlers with quoted-argument support
+- Optional history and tab completion
+- Deterministic RAM use configured at compile time
+- CMake package export and install support
+- C and C++ consumer examples
 
-## Example
+## Constraints
 
-```text
-> help
-Available commands:
-  help         Show available commands
-  status       Show device status
-  conf         Get/set config values
-  fsm          State machine info
-  log          Set log level
-  reboot       Restart the device
+- `MSH_MAX_COMMANDS` is the total slot count, including built-in `help`
+- User command capacity is `MSH_MAX_COMMANDS - 1`
+- Input is ASCII-oriented; there is no Unicode line-editing claim
+- `msh_feed()` is not ISR-safe or reentrant on a shared `msh_t`
+- Output callbacks are synchronous and receive borrowed strings that may be stack-backed
 
-> conf get mqtt_port
-mqtt_port = 8883
-
-> fsm state
-Current: ONLINE
-
-> log level warn
-Log level set to WARN
-
-> reboot
-Rebooting...
-```
-
-## Repository Layout
-
-| Path | Purpose |
-|------|---------|
-| `include/msh.h` | Public API |
-| `src/msh.c` | Reference implementation |
-| `tests/test_all.c` | Unit and behavior tests |
-| `docs/API_REFERENCE.md` | API reference |
-| `docs/DESIGN.md` | Design rationale |
-| `docs/PORTING_GUIDE.md` | Platform integration notes |
-
-## Quick Start
-
-### 1. Add the library
-
-Copy `include/msh.h` and `src/msh.c` into your firmware project, or vendor the repository as a library.
-
-### 2. Register commands
+## Minimal Example
 
 ```c
 #include "msh.h"
 
-static int cmd_status(int argc, const char **argv, void *ctx) {
-    (void)argc;
-    (void)argv;
-    device_t *dev = (device_t *)ctx;
-
-    printf("State: %s, Uptime: %lu s\n",
-           mfsm_state_name(&dev->fsm),
-           dev->uptime_s);
-    return 0;
+static void uart_print(const char *str, void *ctx) {
+    (void)ctx;
+    uart_write_blocking(str);
 }
 
-static int cmd_reboot(int argc, const char **argv, void *ctx) {
+static int cmd_status(int argc, const char *const *argv, void *ctx) {
     (void)argc;
     (void)argv;
     (void)ctx;
-    NVIC_SystemReset();
+    uart_write_blocking("ok\r\n");
     return 0;
 }
 
 static msh_t shell;
 
-void shell_init(device_t *dev) {
-    msh_init(&shell, uart_print, dev);
-    msh_register(&shell, "status", "Show device status", cmd_status);
-    msh_register(&shell, "reboot", "Restart the device", cmd_reboot);
+void shell_init(void) {
+    msh_init(&shell, uart_print, NULL);
+    msh_register(&shell, "status", "Show status", cmd_status);
     msh_prompt(&shell);
 }
 ```
 
-### 3. Feed bytes from your console
+## ISR Handoff Pattern
+
+Do not call `msh_feed()` directly from an ISR. Push received bytes into a caller-owned ring buffer in the interrupt handler, then drain that buffer from the owning main loop or task:
 
 ```c
-void USART2_IRQHandler(void) {
-    if (USART2->SR & USART_SR_RXNE) {
-        char c = (char)(USART2->DR & 0xFF);
-        msh_feed(&shell, c);
+void uart_rx_isr(void) {
+    ring_push(&rx_ring, uart_read_byte());
+}
+
+void shell_poll(void) {
+    uint8_t byte;
+    while (ring_pop(&rx_ring, &byte)) {
+        msh_feed(&shell, (char)byte);
     }
 }
 ```
 
-### 4. Provide an output callback
+## Build
 
-```c
-static void uart_print(const char *str, void *ctx) {
-    (void)ctx;
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
-}
+### CMake
+
+```sh
+cmake -S . -B build -DMICROSH_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build
 ```
 
-## Build and Test
-
-The project ships with a minimal test target in `tests/Makefile`.
-The CI badge above tracks the same test build on GitHub Actions with both GCC and Clang on Ubuntu.
-
-Example with GCC or Clang on a POSIX-like environment:
+### Makefile Test Path
 
 ```sh
 cd tests
 make
 ```
 
-Or directly:
-
-```sh
-cc -std=c99 -Wall -Wextra -Wpedantic -Werror -I../include ../src/msh.c test_all.c -o test_all
-./test_all
-```
-
-## Configuration
-
-| Macro | Default | Description |
-|------|---------|-------------|
-| `MSH_MAX_COMMANDS` | `16` | Maximum registered commands |
-| `MSH_LINE_SIZE` | `128` | Maximum input line length |
-| `MSH_MAX_ARGS` | `8` | Maximum parsed arguments |
-| `MSH_ENABLE_HISTORY` | `1` | Enable history navigation |
-| `MSH_HISTORY_DEPTH` | `4` | Number of stored history entries |
-| `MSH_ENABLE_COMPLETE` | `1` | Enable tab completion |
-
-## API Overview
-
-| Function | Description |
-|------|-------------|
-| `msh_init` | Initialize the shell and register built-in `help` |
-| `msh_register` | Register a command |
-| `msh_feed` | Process one incoming byte |
-| `msh_exec` | Execute a line programmatically |
-| `msh_prompt` | Print the configured prompt |
-| `msh_set_prompt` | Change the prompt string |
-| `msh_set_echo` | Enable or disable echo |
-| `msh_command_count` | Return the number of registered commands |
-| `msh_command_at` | Enumerate commands |
-
-Full reference: [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
-
 ## Documentation
 
-| Document | Content |
-|------|---------|
-| [API Reference](docs/API_REFERENCE.md) | Public API and error codes |
-| [Design Rationale](docs/DESIGN.md) | Core implementation tradeoffs |
-| [Porting Guide](docs/PORTING_GUIDE.md) | Integration patterns for common targets |
-| [Contributing Guide](CONTRIBUTING.md) | Scope and contribution expectations |
-| [Changelog](CHANGELOG.md) | Release history |
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
+- [docs/COOKBOOK.md](docs/COOKBOOK.md)
+- [docs/DESIGN.md](docs/DESIGN.md)
+- [docs/ISSUES.md](docs/ISSUES.md)
+- [docs/PORTING_GUIDE.md](docs/PORTING_GUIDE.md)
+- [docs/VERIFICATION.md](docs/VERIFICATION.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
-## Ecosystem Integration
+## Status
 
-`microsh` is intended to pair well with small embedded runtime libraries:
-
-| Library | Shell command | What it exposes |
-|------|--------------|-----------------|
-| [microfsm](https://github.com/Vanderhell/microfsm) | `fsm state` | Current state and transitions |
-| [microres](https://github.com/Vanderhell/microres) | `breaker status` | Breaker state and reset hooks |
-| [microconf](https://github.com/Vanderhell/microconf) | `conf get/set` | Runtime config inspection and mutation |
-| [microlog](https://github.com/Vanderhell/microlog) | `log level` | Runtime log level control |
-
-## Project Status
-
-`microsh` is positioned as a small, production-oriented embedded utility library. The repository includes source, tests, changelog, contribution notes, and implementation docs suitable for an initial public GitHub release.
-
-## License
-
-Released under the MIT License. Copyright (c) 2026 Vanderhell.
-See [LICENSE](LICENSE).
+This repository contains the implementation, tests, packaging metadata, CI definitions, and documentation for a small embedded utility library. Verification evidence and any remaining gaps are tracked in [docs/VERIFICATION.md](docs/VERIFICATION.md).
