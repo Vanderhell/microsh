@@ -51,7 +51,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
+        include:
+          - c_compiler: gcc
+            cxx_compiler: g++
+          - c_compiler: clang
+            cxx_compiler: clang++
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update
@@ -59,8 +63,12 @@ jobs:
       - run: >
           cmake -S . -B build -G Ninja
           -DMICROSH_BUILD_TESTS=ON
-          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx_compiler }}
           -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
 
