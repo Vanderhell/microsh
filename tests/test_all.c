@@ -292,6 +292,7 @@ TEST(test_interactive_overflow_rejected)
     for (i = 0; i < (size_t)MSH_LINE_SIZE; ++i) {
         msh_feed(&shell_instance, 'x');
     }
+    reset_output();
     msh_feed(&shell_instance, '\r');
     ASSERT_EQ(0, handler_calls);
     ASSERT_STR_CONTAINS(output_buf, "input too long");

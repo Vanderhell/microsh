@@ -96,6 +96,7 @@ static void msh_line_reset(msh_t *sh)
     sh->line[0] = '\0';
 }
 
+#if MSH_ENABLE_HISTORY
 static void msh_line_set(msh_t *sh, const char *text)
 {
     size_t len;
@@ -111,6 +112,7 @@ static void msh_line_set(msh_t *sh, const char *text)
     sh->cursor = (uint8_t)len;
     sh->line_overflow = false;
 }
+#endif
 
 static bool msh_line_insert_char(msh_t *sh, char c)
 {
