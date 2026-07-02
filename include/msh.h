@@ -1,7 +1,7 @@
 /*
- * microsh — Minimal debug shell for embedded systems.
+ * microsh - Minimal debug shell for embedded systems.
  *
- * C99 · Zero dependencies · Zero allocations · UART-friendly · Portable
+ * C99, zero third-party runtime dependencies, zero dynamic allocation.
  *
  * SPDX-License-Identifier: MIT
  * https://github.com/Vanderhell/microsh
@@ -14,187 +14,208 @@
 extern "C" {
 #endif
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
-/* ── Configuration ─────────────────────────────────────────────────────── */
+/* Configuration defaults */
 
-/** Maximum registered commands. */
 #ifndef MSH_MAX_COMMANDS
 #define MSH_MAX_COMMANDS 16
 #endif
 
-/** Maximum input line length (including NUL). */
 #ifndef MSH_LINE_SIZE
 #define MSH_LINE_SIZE 128
 #endif
 
-/** Maximum arguments per command (including command name). */
 #ifndef MSH_MAX_ARGS
 #define MSH_MAX_ARGS 8
 #endif
 
-/** Enable command history (ring buffer of previous lines). */
 #ifndef MSH_ENABLE_HISTORY
 #define MSH_ENABLE_HISTORY 1
 #endif
 
-/** Number of history entries. */
 #ifndef MSH_HISTORY_DEPTH
 #define MSH_HISTORY_DEPTH 4
 #endif
 
-/** Enable tab-completion of command names. */
 #ifndef MSH_ENABLE_COMPLETE
 #define MSH_ENABLE_COMPLETE 1
 #endif
 
-/* ── Error codes ───────────────────────────────────────────────────────── */
+/* Configuration validation */
+
+#define MSH_HELP_NAME "help"
+#define MSH_HELP_NAME_LEN 4u
+
+#if (MSH_MAX_COMMANDS) < 1
+#error "microsh: MSH_MAX_COMMANDS must be at least 1 and includes the built-in help command"
+#endif
+
+#if (MSH_MAX_COMMANDS) > 255
+#error "microsh: MSH_MAX_COMMANDS must be <= 255"
+#endif
+
+#if (MSH_LINE_SIZE) < (MSH_HELP_NAME_LEN + 1u)
+#error "microsh: MSH_LINE_SIZE must fit the built-in help command plus NUL"
+#endif
+
+#if (MSH_LINE_SIZE) > 256
+#error "microsh: MSH_LINE_SIZE must be <= 256 because msh_t cursor and length are byte-sized"
+#endif
+
+#if (MSH_MAX_ARGS) < 1
+#error "microsh: MSH_MAX_ARGS must be at least 1"
+#endif
+
+#if (MSH_MAX_ARGS) > 255
+#error "microsh: MSH_MAX_ARGS must be <= 255"
+#endif
+
+#if ((MSH_ENABLE_HISTORY) != 0) && ((MSH_ENABLE_HISTORY) != 1)
+#error "microsh: MSH_ENABLE_HISTORY must be exactly 0 or 1"
+#endif
+
+#if ((MSH_ENABLE_COMPLETE) != 0) && ((MSH_ENABLE_COMPLETE) != 1)
+#error "microsh: MSH_ENABLE_COMPLETE must be exactly 0 or 1"
+#endif
+
+#if MSH_ENABLE_HISTORY
+#if (MSH_HISTORY_DEPTH) < 1
+#error "microsh: MSH_HISTORY_DEPTH must be at least 1 when history is enabled"
+#endif
+#if (MSH_HISTORY_DEPTH) > 255
+#error "microsh: MSH_HISTORY_DEPTH must be <= 255"
+#endif
+#endif
+
+/* ABI-affecting configuration guard */
+
+#define MSH_DETAIL_CAT_IMPL(a, b) a##b
+#define MSH_DETAIL_CAT(a, b) MSH_DETAIL_CAT_IMPL(a, b)
+#define MSH_DETAIL_CAT3(a, b, c) MSH_DETAIL_CAT(MSH_DETAIL_CAT(a, b), c)
+
+#define MSH_ABI_GUARD_STEP1 MSH_DETAIL_CAT3(msh_abi_guard_, MSH_MAX_COMMANDS, _)
+#define MSH_ABI_GUARD_STEP2 MSH_DETAIL_CAT3(MSH_ABI_GUARD_STEP1, MSH_LINE_SIZE, _)
+#define MSH_ABI_GUARD_STEP3 MSH_DETAIL_CAT3(MSH_ABI_GUARD_STEP2, MSH_MAX_ARGS, _)
+#define MSH_ABI_GUARD_STEP4 MSH_DETAIL_CAT3(MSH_ABI_GUARD_STEP3, MSH_ENABLE_HISTORY, _)
+#define MSH_ABI_GUARD_STEP5 MSH_DETAIL_CAT3(MSH_ABI_GUARD_STEP4, MSH_HISTORY_DEPTH, _)
+#define MSH_ABI_GUARD_SYMBOL MSH_DETAIL_CAT3(MSH_ABI_GUARD_STEP5, MSH_ENABLE_COMPLETE, _end)
+
+extern const unsigned char MSH_ABI_GUARD_SYMBOL;
 
 typedef enum {
-    MSH_OK            =  0,   /**< Success.                              */
-    MSH_ERR_NULL      = -1,   /**< NULL pointer argument.                */
-    MSH_ERR_FULL      = -2,   /**< Command table is full.                */
-    MSH_ERR_NOT_FOUND = -3,   /**< Command not found.                    */
-    MSH_ERR_ARGS      = -4,   /**< Wrong number of arguments.            */
-    MSH_ERR_INVALID   = -5,   /**< Invalid input.                        */
+    MSH_OK = 0,
+    MSH_ERR_NULL = -1,
+    MSH_ERR_FULL = -2,
+    MSH_ERR_NOT_FOUND = -3,
+    MSH_ERR_ARGS = -4,
+    MSH_ERR_INVALID = -5,
+    MSH_ERR_INPUT_TOO_LONG = -6
 } msh_err_t;
 
 const char *msh_err_str(msh_err_t err);
 
-/* ── Platform callback ─────────────────────────────────────────────────── */
-
-/**
- * Output callback — write a string to the terminal.
- *
- * @param str  NUL-terminated string to output.
- * @param ctx  User context.
+/*
+ * Output callback contract:
+ * - called synchronously by microsh
+ * - receives a borrowed NUL-terminated string
+ * - the pointer may reference stack-backed temporary storage
+ * - the callback must consume or copy the bytes before returning
+ * - output failures cannot be propagated through the current API
  */
 typedef void (*msh_print_fn)(const char *str, void *ctx);
 
-/* ── Command callback ──────────────────────────────────────────────────── */
-
-/**
- * Command handler.
- *
- * @param argc  Argument count (>= 1, argv[0] is the command name).
- * @param argv  Argument array (NUL-terminated strings).
- * @param ctx   User context from the shell instance.
- * @return 0 on success, negative on error. The return value is displayed
- *         to the user if non-zero.
+/*
+ * Command handler contract:
+ * - argc >= 1 and argv[0] is the command name
+ * - argv and the pointed-to strings are borrowed temporary storage
+ * - argv contents are valid only for the duration of the call
+ * - copy anything needed after the handler returns
  */
-typedef int (*msh_cmd_fn)(int argc, const char **argv, void *ctx);
-
-/* ── Command descriptor ────────────────────────────────────────────────── */
+typedef int (*msh_cmd_fn)(int argc, const char *const *argv, void *ctx);
 
 typedef struct {
-    const char  *name;     /**< Command name (e.g., "conf").             */
-    const char  *help;     /**< One-line help text.                      */
-    msh_cmd_fn   handler;  /**< Command handler function.                */
+    const char *name;
+    const char *help;
+    msh_cmd_fn handler;
 } msh_cmd_t;
 
-/* ── Shell instance ────────────────────────────────────────────────────── */
-
 typedef struct {
-    /* Command table */
-    msh_cmd_t    commands[MSH_MAX_COMMANDS];
-    uint8_t      num_commands;
+    msh_cmd_t commands[MSH_MAX_COMMANDS];
+    uint8_t num_commands;
 
-    /* Input buffer */
-    char         line[MSH_LINE_SIZE];
-    uint8_t      cursor;           /**< Current position in line.         */
-    uint8_t      length;           /**< Current line length.              */
+    char line[MSH_LINE_SIZE];
+    uint8_t cursor;
+    uint8_t length;
+    bool line_overflow;
+    bool saw_cr;
 
-    /* History */
 #if MSH_ENABLE_HISTORY
-    char         history[MSH_HISTORY_DEPTH][MSH_LINE_SIZE];
-    uint8_t      hist_count;       /**< Number of stored entries.         */
-    uint8_t      hist_write;       /**< Next write position (ring).       */
-    int8_t       hist_browse;      /**< Current browse offset (-1=none).  */
+    char history[MSH_HISTORY_DEPTH][MSH_LINE_SIZE];
+    uint8_t hist_count;
+    uint8_t hist_write;
+    uint8_t hist_browse;
 #endif
 
-    /* Escape sequence state machine */
-    uint8_t      esc_state;        /**< 0=normal, 1=got ESC, 2=got '['.   */
+    uint8_t esc_state;
+    uint8_t csi_param;
 
-    /* Output */
     msh_print_fn print;
-    void        *ctx;              /**< User context passed to callbacks.  */
-    const char  *prompt;           /**< Prompt string (default: "> ").     */
-    bool         echo;             /**< Echo typed characters.             */
+    void *ctx;
+    const char *prompt;
+    bool echo;
 } msh_t;
 
-/* ── Init / config ─────────────────────────────────────────────────────── */
-
-/**
- * Initialise shell instance.
+/*
+ * ABI-affecting configuration macros:
+ * - MSH_MAX_COMMANDS
+ * - MSH_LINE_SIZE
+ * - MSH_MAX_ARGS
+ * - MSH_ENABLE_HISTORY
+ * - MSH_HISTORY_DEPTH
+ * - MSH_ENABLE_COMPLETE
  *
- * @param sh     Shell instance (caller-allocated).
- * @param print  Output callback (required).
- * @param ctx    User context passed to all callbacks.
- * @return MSH_OK on success.
+ * Every translation unit that touches msh_t or links against a separately
+ * built microsh library must use identical values for those macros.
+ * Conflicting translation units are unsupported.
  */
+
 msh_err_t msh_init(msh_t *sh, msh_print_fn print, void *ctx);
-
-/**
- * Set prompt string (default: "> "). The string must stay valid
- * (static or const). Pass NULL for no prompt.
- */
 void msh_set_prompt(msh_t *sh, const char *prompt);
-
-/** Enable/disable echo of typed characters. Default: true. */
 void msh_set_echo(msh_t *sh, bool echo);
 
-/* ── Command registration ──────────────────────────────────────────────── */
-
-/**
- * Register a command.
- *
- * @param sh       Shell instance.
- * @param name     Command name (e.g., "reboot"). Must be static/const.
- * @param help     One-line help text. Must be static/const. May be NULL.
- * @param handler  Command handler function.
- * @return MSH_OK or MSH_ERR_FULL.
+/*
+ * Registration rules:
+ * - MSH_MAX_COMMANDS includes the built-in help command
+ * - user command capacity is MSH_MAX_COMMANDS - 1
+ * - name and help are borrowed and must stay valid while registered
+ * - name must be non-empty, unique, printable ASCII, and contain no
+ *   whitespace, quotes, or control characters
  */
 msh_err_t msh_register(msh_t *sh, const char *name, const char *help,
-                        msh_cmd_fn handler);
+                       msh_cmd_fn handler);
 
-/* ── Input processing ──────────────────────────────────────────────────── */
-
-/**
- * Feed one byte from UART/terminal into the shell.
+/*
+ * Feed one received byte.
  *
- * Call this from your UART RX interrupt or polling loop. The shell
- * handles line editing (backspace, arrows), history navigation, tab
- * completion, and executes commands on Enter.
- *
- * @param sh  Shell instance.
- * @param c   Received byte.
+ * Call msh_feed() from a single non-ISR execution context. If bytes arrive in
+ * an ISR, push them into a caller-owned queue or ring buffer and drain that
+ * queue from the owning task or main loop.
  */
 void msh_feed(msh_t *sh, char c);
 
-/**
- * Feed a complete line (without newline) and execute.
- * Useful for testing or scripted input.
+/*
+ * Execute a complete command line without CR/LF.
  *
- * @param sh    Shell instance.
- * @param line  NUL-terminated command line.
- * @return Command return value, or MSH_ERR_NOT_FOUND.
+ * Returns the command handler result or a microsh error code. Overlong input
+ * is rejected with MSH_ERR_INPUT_TOO_LONG instead of being truncated.
  */
 int msh_exec(msh_t *sh, const char *line);
 
-/**
- * Print the prompt. Call once after init and after each command.
- * (Also called internally by msh_feed after command execution.)
- */
 void msh_prompt(msh_t *sh);
-
-/* ── Query ─────────────────────────────────────────────────────────────── */
-
-/** Get number of registered commands. */
 uint8_t msh_command_count(const msh_t *sh);
-
-/** Get command descriptor by index (for enumeration). */
 const msh_cmd_t *msh_command_at(const msh_t *sh, uint8_t index);
 
 #ifdef __cplusplus

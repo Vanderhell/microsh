@@ -1,451 +1,693 @@
 /*
- * microsh — Implementation.
+ * microsh - implementation
  *
  * SPDX-License-Identifier: MIT
  * https://github.com/Vanderhell/microsh
  */
 
 #include "msh.h"
-#include <string.h>
+
 #include <stdio.h>
+#include <string.h>
 
-/* ── Internal constants ────────────────────────────────────────────────── */
+#define MSH_KEY_CR '\r'
+#define MSH_KEY_LF '\n'
+#define MSH_KEY_BS '\b'
+#define MSH_KEY_DEL 127
+#define MSH_KEY_ESC 27
+#define MSH_KEY_TAB '\t'
 
-#define KEY_ENTER     '\r'
-#define KEY_NEWLINE   '\n'
-#define KEY_BACKSPACE '\b'
-#define KEY_DEL       127
-#define KEY_ESC       27
-#define KEY_TAB       '\t'
+#define MSH_ESC_NONE 0u
+#define MSH_ESC_SEEN_ESC 1u
+#define MSH_ESC_SEEN_CSI 2u
 
-/* ── Error strings ─────────────────────────────────────────────────────── */
+typedef enum {
+    MSH_PARSE_OK = 0,
+    MSH_PARSE_TOO_MANY_ARGS,
+    MSH_PARSE_INVALID
+} msh_parse_status_t;
 
-const char *msh_err_str(msh_err_t err)
+typedef struct {
+    int result;
+    bool lookup_failed;
+} msh_exec_result_t;
+
+const unsigned char MSH_ABI_GUARD_SYMBOL = 0;
+
+static void msh_print_str(msh_t *sh, const char *str)
 {
-    switch (err) {
-    case MSH_OK:            return "ok";
-    case MSH_ERR_NULL:      return "null pointer";
-    case MSH_ERR_FULL:      return "command table full";
-    case MSH_ERR_NOT_FOUND: return "command not found";
-    case MSH_ERR_ARGS:      return "wrong arguments";
-    case MSH_ERR_INVALID:   return "invalid input";
-    default:                return "unknown error";
-    }
-}
-
-/* ── Output helpers ────────────────────────────────────────────────────── */
-
-static void sh_print(msh_t *sh, const char *str)
-{
-    if (sh->print != NULL && str != NULL) {
+    if ((sh != NULL) && (sh->print != NULL) && (str != NULL)) {
         sh->print(str, sh->ctx);
     }
 }
 
-static void sh_putc(msh_t *sh, char c)
+static void msh_print_char(msh_t *sh, char c)
 {
-    char buf[2] = { c, '\0' };
-    sh_print(sh, buf);
+    char buf[2];
+    buf[0] = c;
+    buf[1] = '\0';
+    msh_print_str(sh, buf);
 }
 
-/* ── Line buffer helpers ───────────────────────────────────────────────── */
-
-static void line_clear(msh_t *sh)
+static void msh_write_prefix(msh_t *sh, uint8_t count)
 {
-    sh->cursor = 0;
-    sh->length = 0;
+    char saved;
+
+    if (count == 0u) {
+        return;
+    }
+
+    saved = sh->line[count];
+    sh->line[count] = '\0';
+    msh_print_str(sh, sh->line);
+    sh->line[count] = saved;
+}
+
+static void msh_redraw_line(msh_t *sh, uint8_t previous_length)
+{
+    uint8_t i;
+
+    if ((sh == NULL) || !sh->echo) {
+        return;
+    }
+
+    msh_print_str(sh, "\r");
+    if (sh->prompt != NULL) {
+        msh_print_str(sh, sh->prompt);
+    }
+    msh_print_str(sh, sh->line);
+
+    for (i = sh->length; i < previous_length; ++i) {
+        msh_print_char(sh, ' ');
+    }
+
+    msh_print_str(sh, "\r");
+    if (sh->prompt != NULL) {
+        msh_print_str(sh, sh->prompt);
+    }
+    msh_write_prefix(sh, sh->cursor);
+}
+
+static void msh_line_reset(msh_t *sh)
+{
+    sh->cursor = 0u;
+    sh->length = 0u;
+    sh->line_overflow = false;
     sh->line[0] = '\0';
 }
 
-static void line_insert_char(msh_t *sh, char c)
+static void msh_line_set(msh_t *sh, const char *text)
 {
-    if (sh->length >= MSH_LINE_SIZE - 1) return;
+    size_t len;
 
-    /* Shift right from cursor */
-    for (uint8_t i = sh->length; i > sh->cursor; i--) {
-        sh->line[i] = sh->line[i - 1];
+    len = strlen(text);
+    if (len >= (size_t)MSH_LINE_SIZE) {
+        len = (size_t)MSH_LINE_SIZE - 1u;
     }
-    sh->line[sh->cursor] = c;
-    sh->length++;
-    sh->cursor++;
-    sh->line[sh->length] = '\0';
+
+    memcpy(sh->line, text, len);
+    sh->line[len] = '\0';
+    sh->length = (uint8_t)len;
+    sh->cursor = (uint8_t)len;
+    sh->line_overflow = false;
 }
 
-static void line_delete_back(msh_t *sh)
+static bool msh_line_insert_char(msh_t *sh, char c)
 {
-    if (sh->cursor == 0) return;
+    uint8_t i;
 
-    /* Shift left over cursor-1 */
-    for (uint8_t i = sh->cursor - 1; i < sh->length - 1; i++) {
-        sh->line[i] = sh->line[i + 1];
+    if (sh->length >= (uint8_t)(MSH_LINE_SIZE - 1u)) {
+        sh->line_overflow = true;
+        return false;
     }
+
+    for (i = sh->length; i > sh->cursor; --i) {
+        sh->line[i] = sh->line[i - 1u];
+    }
+
+    sh->line[sh->cursor] = c;
+    sh->cursor++;
+    sh->length++;
+    sh->line[sh->length] = '\0';
+    return true;
+}
+
+static bool msh_line_delete_back(msh_t *sh)
+{
+    uint8_t i;
+
+    if (sh->cursor == 0u) {
+        return false;
+    }
+
+    for (i = sh->cursor; i <= sh->length; ++i) {
+        sh->line[i - 1u] = sh->line[i];
+    }
+
     sh->cursor--;
     sh->length--;
-    sh->line[sh->length] = '\0';
+    return true;
 }
 
-/* ── History ───────────────────────────────────────────────────────────── */
-
-#if MSH_ENABLE_HISTORY
-static void history_push(msh_t *sh, const char *line)
+static bool msh_line_delete_forward(msh_t *sh)
 {
-    if (line[0] == '\0') return;
+    uint8_t i;
 
-    /* Don't push duplicates of the last entry */
-    if (sh->hist_count > 0) {
-        uint8_t last = (sh->hist_write + MSH_HISTORY_DEPTH - 1) % MSH_HISTORY_DEPTH;
-        if (strcmp(sh->history[last], line) == 0) return;
+    if (sh->cursor >= sh->length) {
+        return false;
     }
 
-    strncpy(sh->history[sh->hist_write], line, MSH_LINE_SIZE - 1);
-    sh->history[sh->hist_write][MSH_LINE_SIZE - 1] = '\0';
-    sh->hist_write = (sh->hist_write + 1) % MSH_HISTORY_DEPTH;
-    if (sh->hist_count < MSH_HISTORY_DEPTH) {
+    for (i = sh->cursor; i < sh->length; ++i) {
+        sh->line[i] = sh->line[i + 1u];
+    }
+
+    sh->length--;
+    return true;
+}
+
+#if MSH_ENABLE_HISTORY
+static void msh_history_push(msh_t *sh, const char *line)
+{
+    uint8_t last_index;
+
+    if (line[0] == '\0') {
+        return;
+    }
+
+    if (sh->hist_count > 0u) {
+        last_index = (uint8_t)((sh->hist_write + MSH_HISTORY_DEPTH - 1u) %
+                               MSH_HISTORY_DEPTH);
+        if (strcmp(sh->history[last_index], line) == 0) {
+            return;
+        }
+    }
+
+    memcpy(sh->history[sh->hist_write], line, (size_t)MSH_LINE_SIZE);
+    sh->hist_write = (uint8_t)((sh->hist_write + 1u) % MSH_HISTORY_DEPTH);
+    if (sh->hist_count < (uint8_t)MSH_HISTORY_DEPTH) {
         sh->hist_count++;
     }
 }
 
-static const char *history_get(msh_t *sh, uint8_t offset)
+static const char *msh_history_get(const msh_t *sh, uint8_t offset)
 {
-    if (offset == 0 || offset > sh->hist_count) return NULL;
-    /* offset=1 → most recent, offset=hist_count → oldest */
-    int idx = (int)sh->hist_write - (int)offset;
-    if (idx < 0) idx += MSH_HISTORY_DEPTH;
-    return sh->history[idx];
+    int index;
+
+    if ((offset == 0u) || (offset > sh->hist_count)) {
+        return NULL;
+    }
+
+    index = (int)sh->hist_write - (int)offset;
+    while (index < 0) {
+        index += MSH_HISTORY_DEPTH;
+    }
+
+    return sh->history[index];
 }
 
-static void history_browse(msh_t *sh, int direction)
+static void msh_history_browse(msh_t *sh, int direction)
 {
-    int new_offset = sh->hist_browse + direction;
-    if (new_offset < 0) new_offset = 0;
-    if (new_offset > (int)sh->hist_count) new_offset = (int)sh->hist_count;
+    int new_offset;
+    const char *entry;
+    uint8_t previous_length;
 
-    sh->hist_browse = (int8_t)new_offset;
+    previous_length = sh->length;
+    new_offset = (int)sh->hist_browse + direction;
+    if (new_offset < 0) {
+        new_offset = 0;
+    }
+    if (new_offset > (int)sh->hist_count) {
+        new_offset = (int)sh->hist_count;
+    }
 
-    /* Erase current line on terminal */
-    sh_print(sh, "\r");
-    if (sh->prompt) sh_print(sh, sh->prompt);
-    /* Overwrite with spaces */
-    for (uint8_t i = 0; i < sh->length; i++) sh_putc(sh, ' ');
-    sh_print(sh, "\r");
-    if (sh->prompt) sh_print(sh, sh->prompt);
-
-    if (new_offset == 0) {
-        line_clear(sh);
+    sh->hist_browse = (uint8_t)new_offset;
+    if (sh->hist_browse == 0u) {
+        msh_line_reset(sh);
     } else {
-        const char *entry = history_get(sh, (uint8_t)new_offset);
+        entry = msh_history_get(sh, sh->hist_browse);
         if (entry != NULL) {
-            strncpy(sh->line, entry, MSH_LINE_SIZE - 1);
-            sh->line[MSH_LINE_SIZE - 1] = '\0';
-            sh->length = (uint8_t)strlen(sh->line);
-            sh->cursor = sh->length;
-            sh_print(sh, sh->line);
+            msh_line_set(sh, entry);
         }
     }
+
+    msh_redraw_line(sh, previous_length);
 }
 #endif
 
-/* ── Tab completion ────────────────────────────────────────────────────── */
+static bool msh_name_is_valid(const char *name)
+{
+    size_t i;
+    size_t len;
+    unsigned char ch;
+
+    len = strlen(name);
+    if ((len == 0u) || (len >= (size_t)MSH_LINE_SIZE)) {
+        return false;
+    }
+
+    for (i = 0; i < len; ++i) {
+        ch = (unsigned char)name[i];
+        if ((ch < 33u) || (ch > 126u) || (ch == '"') || (ch == '\'')) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 #if MSH_ENABLE_COMPLETE
-static void tab_complete(msh_t *sh)
+static void msh_tab_complete(msh_t *sh)
 {
-    if (sh->length == 0) return;
+    const msh_cmd_t *match;
+    size_t name_len;
+    uint8_t i;
+    uint8_t match_count;
 
-    /* Find matching commands */
-    const msh_cmd_t *match = NULL;
-    int match_count = 0;
+    if ((sh->length == 0u) || (sh->cursor != sh->length) ||
+        (strchr(sh->line, ' ') != NULL) || (strchr(sh->line, '\t') != NULL)) {
+        return;
+    }
 
-    for (uint8_t i = 0; i < sh->num_commands; i++) {
-        if (strncmp(sh->commands[i].name, sh->line, sh->length) == 0) {
+    match = NULL;
+    match_count = 0u;
+    for (i = 0u; i < sh->num_commands; ++i) {
+        if (strncmp(sh->commands[i].name, sh->line, (size_t)sh->length) == 0) {
             match = &sh->commands[i];
             match_count++;
         }
     }
 
-    if (match_count == 1 && match != NULL) {
-        /* Single match — complete it */
-        const char *name = match->name;
-        uint8_t name_len = (uint8_t)strlen(name);
+    if ((match_count == 1u) && (match != NULL)) {
+        uint8_t previous_length;
 
-        /* Replace line with completed command + space */
-        strncpy(sh->line, name, MSH_LINE_SIZE - 2);
-        sh->line[name_len] = ' ';
-        sh->line[name_len + 1] = '\0';
-        sh->length = name_len + 1;
+        previous_length = sh->length;
+        name_len = strlen(match->name);
+        memcpy(sh->line, match->name, name_len);
+        sh->length = (uint8_t)name_len;
         sh->cursor = sh->length;
+        if ((name_len + 2u) <= (size_t)MSH_LINE_SIZE) {
+            sh->line[sh->length] = ' ';
+            sh->length++;
+            sh->cursor = sh->length;
+        }
+        sh->line[sh->length] = '\0';
+        msh_redraw_line(sh, previous_length);
+        return;
+    }
 
-        /* Redraw */
-        sh_print(sh, "\r");
-        if (sh->prompt) sh_print(sh, sh->prompt);
-        sh_print(sh, sh->line);
-    } else if (match_count > 1) {
-        /* Multiple matches — show them */
-        sh_print(sh, "\r\n");
-        for (uint8_t i = 0; i < sh->num_commands; i++) {
-            if (strncmp(sh->commands[i].name, sh->line, sh->length) == 0) {
-                sh_print(sh, "  ");
-                sh_print(sh, sh->commands[i].name);
-                sh_print(sh, "\r\n");
+    if (match_count > 1u) {
+        msh_print_str(sh, "\r\n");
+        for (i = 0u; i < sh->num_commands; ++i) {
+            if (strncmp(sh->commands[i].name, sh->line,
+                        (size_t)sh->length) == 0) {
+                msh_print_str(sh, "  ");
+                msh_print_str(sh, sh->commands[i].name);
+                msh_print_str(sh, "\r\n");
             }
         }
-        /* Redraw prompt + current input */
-        if (sh->prompt) sh_print(sh, sh->prompt);
-        sh_print(sh, sh->line);
+        msh_redraw_line(sh, sh->length);
     }
 }
 #endif
 
-/* ── Argument parsing ──────────────────────────────────────────────────── */
-
-/**
- * Parse a line into argc/argv. Modifies the line in-place (inserts NULs).
- * Returns argc (0 if empty line).
- */
-static int parse_args(char *line, const char **argv, int max_args)
+static msh_parse_status_t msh_parse_args(char *line, const char *argv[],
+                                         uint8_t *argc_out)
 {
-    int argc = 0;
-    char *p = line;
+    uint8_t argc;
+    char *p;
 
-    while (*p != '\0' && argc < max_args) {
-        /* Skip whitespace */
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0') break;
+    argc = 0u;
+    p = line;
 
-        /* Check for quoted string */
+    while (*p != '\0') {
+        while ((*p == ' ') || (*p == '\t')) {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        if (argc >= (uint8_t)MSH_MAX_ARGS) {
+            return MSH_PARSE_TOO_MANY_ARGS;
+        }
+
         if (*p == '"') {
-            p++;  /* skip opening quote */
-            argv[argc++] = p;
-            while (*p != '\0' && *p != '"') p++;
-            if (*p == '"') *p++ = '\0';
-        } else {
-            argv[argc++] = p;
-            while (*p != '\0' && *p != ' ' && *p != '\t') p++;
-            if (*p != '\0') *p++ = '\0';
+            argv[argc++] = ++p;
+            while ((*p != '\0') && (*p != '"')) {
+                ++p;
+            }
+            if (*p != '"') {
+                return MSH_PARSE_INVALID;
+            }
+            *p = '\0';
+            ++p;
+            if ((*p != '\0') && (*p != ' ') && (*p != '\t')) {
+                return MSH_PARSE_INVALID;
+            }
+            continue;
+        }
+
+        argv[argc++] = p;
+        while ((*p != '\0') && (*p != ' ') && (*p != '\t')) {
+            ++p;
+        }
+        if (*p != '\0') {
+            *p = '\0';
+            ++p;
         }
     }
 
-    return argc;
+    *argc_out = argc;
+    return MSH_PARSE_OK;
 }
 
-/* ── Built-in help command ─────────────────────────────────────────────── */
-
-static int builtin_help(int argc, const char **argv, void *ctx)
+static int msh_builtin_help(int argc, const char *const *argv, void *ctx)
 {
-    msh_t *sh = (msh_t *)ctx;
-    (void)argc; (void)argv;
+    msh_t *sh;
+    uint8_t i;
 
-    sh_print(sh, "Available commands:\r\n");
-    for (uint8_t i = 0; i < sh->num_commands; i++) {
+    (void)argc;
+    (void)argv;
+
+    sh = (msh_t *)ctx;
+    msh_print_str(sh, "Available commands:\r\n");
+    for (i = 0u; i < sh->num_commands; ++i) {
         char buf[MSH_LINE_SIZE];
-        int n = snprintf(buf, sizeof(buf), "  %-12s %s\r\n",
-                         sh->commands[i].name,
-                         sh->commands[i].help ? sh->commands[i].help : "");
-        if (n > 0) sh_print(sh, buf);
+        int written;
+
+        written = snprintf(buf, sizeof(buf), "  %-12s %s\r\n",
+                           sh->commands[i].name,
+                           (sh->commands[i].help != NULL) ? sh->commands[i].help
+                                                          : "");
+        if (written > 0) {
+            msh_print_str(sh, buf);
+        }
     }
 
-    return 0;
+    return MSH_OK;
 }
 
-/* ── Execute a parsed line ─────────────────────────────────────────────── */
+static void msh_print_result(msh_t *sh, int result)
+{
+    char buf[48];
+    int written;
 
-static int execute(msh_t *sh, char *line)
+    written = snprintf(buf, sizeof(buf), "error: %d (%s)\r\n", result,
+                       msh_err_str((msh_err_t)result));
+    if (written > 0) {
+        msh_print_str(sh, buf);
+    }
+}
+
+static void msh_print_not_found(msh_t *sh, const char *name)
+{
+    msh_print_str(sh, "Unknown command: ");
+    msh_print_str(sh, name);
+    msh_print_str(sh, "\r\nType 'help' for available commands.\r\n");
+}
+
+static msh_exec_result_t msh_execute_line(msh_t *sh, char *line, bool emit_lookup_error)
 {
     const char *argv[MSH_MAX_ARGS];
-    int argc = parse_args(line, argv, MSH_MAX_ARGS);
+    uint8_t argc;
+    uint8_t i;
+    msh_exec_result_t exec_result;
+    msh_parse_status_t parse_status;
 
-    if (argc == 0) return MSH_OK;  /* empty line */
+    exec_result.result = MSH_OK;
+    exec_result.lookup_failed = false;
 
-    /* Find command */
-    for (uint8_t i = 0; i < sh->num_commands; i++) {
+    parse_status = msh_parse_args(line, argv, &argc);
+    if (parse_status == MSH_PARSE_TOO_MANY_ARGS) {
+        exec_result.result = MSH_ERR_ARGS;
+        return exec_result;
+    }
+    if (parse_status == MSH_PARSE_INVALID) {
+        exec_result.result = MSH_ERR_INVALID;
+        return exec_result;
+    }
+    if (argc == 0u) {
+        return exec_result;
+    }
+
+    for (i = 0u; i < sh->num_commands; ++i) {
         if (strcmp(sh->commands[i].name, argv[0]) == 0) {
-            /* The help command gets the shell as ctx so it can enumerate */
-            if (sh->commands[i].handler == builtin_help) {
-                return sh->commands[i].handler(argc, argv, sh);
+            if (sh->commands[i].handler == msh_builtin_help) {
+                exec_result.result = sh->commands[i].handler((int)argc, argv, sh);
+            } else {
+                exec_result.result =
+                    sh->commands[i].handler((int)argc, argv, sh->ctx);
             }
-            return sh->commands[i].handler(argc, argv, sh->ctx);
+            return exec_result;
         }
     }
 
-    sh_print(sh, "Unknown command: ");
-    sh_print(sh, argv[0]);
-    sh_print(sh, "\r\nType 'help' for available commands.\r\n");
-
-    return MSH_ERR_NOT_FOUND;
+    exec_result.result = MSH_ERR_NOT_FOUND;
+    exec_result.lookup_failed = true;
+    if (emit_lookup_error) {
+        msh_print_not_found(sh, argv[0]);
+    }
+    return exec_result;
 }
 
-/* ── Public API ────────────────────────────────────────────────────────── */
+static void msh_handle_enter(msh_t *sh)
+{
+    char exec_line[MSH_LINE_SIZE];
+    msh_exec_result_t exec_result;
+
+    msh_print_str(sh, "\r\n");
+
+    if (sh->line_overflow) {
+        msh_line_reset(sh);
+        msh_print_result(sh, MSH_ERR_INPUT_TOO_LONG);
+        msh_prompt(sh);
+        return;
+    }
+
+#if MSH_ENABLE_HISTORY
+    msh_history_push(sh, sh->line);
+    sh->hist_browse = 0u;
+#endif
+
+    memcpy(exec_line, sh->line, (size_t)sh->length + 1u);
+    msh_line_reset(sh);
+
+    exec_result = msh_execute_line(sh, exec_line, true);
+    if ((exec_result.result != MSH_OK) && !exec_result.lookup_failed) {
+        msh_print_result(sh, exec_result.result);
+    }
+
+    msh_prompt(sh);
+}
+
+const char *msh_err_str(msh_err_t err)
+{
+    switch (err) {
+    case MSH_OK:
+        return "ok";
+    case MSH_ERR_NULL:
+        return "null pointer";
+    case MSH_ERR_FULL:
+        return "command table full";
+    case MSH_ERR_NOT_FOUND:
+        return "command not found";
+    case MSH_ERR_ARGS:
+        return "wrong arguments";
+    case MSH_ERR_INVALID:
+        return "invalid input";
+    case MSH_ERR_INPUT_TOO_LONG:
+        return "input too long";
+    default:
+        return "unknown error";
+    }
+}
 
 msh_err_t msh_init(msh_t *sh, msh_print_fn print, void *ctx)
 {
-    if (sh == NULL || print == NULL) return MSH_ERR_NULL;
+    msh_err_t init_result;
 
-    memset(sh, 0, sizeof(*sh));
-    sh->print  = print;
-    sh->ctx    = ctx;
+    if ((sh == NULL) || (print == NULL)) {
+        return MSH_ERR_NULL;
+    }
+
+    *sh = (msh_t){0};
+    sh->print = print;
+    sh->ctx = ctx;
     sh->prompt = "> ";
-    sh->echo   = true;
+    sh->echo = true;
 
-#if MSH_ENABLE_HISTORY
-    sh->hist_browse = 0;
-#endif
-
-    /* Register built-in help */
-    msh_register(sh, "help", "Show available commands", builtin_help);
+    init_result = msh_register(sh, MSH_HELP_NAME, "Show available commands",
+                               msh_builtin_help);
+    if (init_result != MSH_OK) {
+        return init_result;
+    }
 
     return MSH_OK;
 }
 
 void msh_set_prompt(msh_t *sh, const char *prompt)
 {
-    if (sh != NULL) sh->prompt = prompt;
+    if (sh != NULL) {
+        sh->prompt = prompt;
+    }
 }
 
 void msh_set_echo(msh_t *sh, bool echo)
 {
-    if (sh != NULL) sh->echo = echo;
+    if (sh != NULL) {
+        sh->echo = echo;
+    }
 }
 
 msh_err_t msh_register(msh_t *sh, const char *name, const char *help,
-                        msh_cmd_fn handler)
+                       msh_cmd_fn handler)
 {
-    if (sh == NULL || name == NULL || handler == NULL) return MSH_ERR_NULL;
-    if (sh->num_commands >= MSH_MAX_COMMANDS) return MSH_ERR_FULL;
+    uint8_t i;
+    msh_cmd_t *slot;
 
-    msh_cmd_t *cmd = &sh->commands[sh->num_commands++];
-    cmd->name    = name;
-    cmd->help    = help;
-    cmd->handler = handler;
+    if ((sh == NULL) || (name == NULL) || (handler == NULL)) {
+        return MSH_ERR_NULL;
+    }
+    if (!msh_name_is_valid(name)) {
+        return MSH_ERR_INVALID;
+    }
+    for (i = 0u; i < sh->num_commands; ++i) {
+        if (strcmp(sh->commands[i].name, name) == 0) {
+            return MSH_ERR_INVALID;
+        }
+    }
+    if (sh->num_commands >= (uint8_t)MSH_MAX_COMMANDS) {
+        return MSH_ERR_FULL;
+    }
 
+    slot = &sh->commands[sh->num_commands];
+    *slot = (msh_cmd_t){name, help, handler};
+    sh->num_commands++;
     return MSH_OK;
 }
 
 void msh_prompt(msh_t *sh)
 {
-    if (sh == NULL) return;
-    if (sh->prompt != NULL) {
-        sh_print(sh, sh->prompt);
+    if ((sh != NULL) && (sh->prompt != NULL)) {
+        msh_print_str(sh, sh->prompt);
     }
 }
 
 void msh_feed(msh_t *sh, char c)
 {
-    if (sh == NULL) return;
+    uint8_t previous_length;
+    unsigned char byte;
 
-    /* ── Escape sequence handling ──────────────────────────────────────── */
-    if (sh->esc_state == 1) {
-        if (c == '[') {
-            sh->esc_state = 2;
-            return;
-        }
-        sh->esc_state = 0;
+    if (sh == NULL) {
         return;
     }
 
-    if (sh->esc_state == 2) {
-        sh->esc_state = 0;
-        switch (c) {
-        case 'A':  /* Up arrow */
-#if MSH_ENABLE_HISTORY
-            history_browse(sh, 1);
-#endif
+    byte = (unsigned char)c;
+
+    if (sh->esc_state == MSH_ESC_SEEN_ESC) {
+        sh->esc_state = MSH_ESC_NONE;
+        if (c == '[') {
+            sh->esc_state = MSH_ESC_SEEN_CSI;
+            sh->csi_param = 0u;
             return;
-        case 'B':  /* Down arrow */
-#if MSH_ENABLE_HISTORY
-            history_browse(sh, -1);
-#endif
-            return;
-        case 'C':  /* Right arrow */
-            if (sh->cursor < sh->length) {
-                sh->cursor++;
-                sh_print(sh, "\033[C");
+        }
+    } else if (sh->esc_state == MSH_ESC_SEEN_CSI) {
+        if ((byte >= (unsigned char)'0') && (byte <= (unsigned char)'9')) {
+            if (sh->csi_param < 25u) {
+                sh->csi_param = (uint8_t)(sh->csi_param * 10u + (byte - '0'));
             }
             return;
-        case 'D':  /* Left arrow */
-            if (sh->cursor > 0) {
+        }
+        if (c == ';' || c == '?') {
+            return;
+        }
+
+        sh->esc_state = MSH_ESC_NONE;
+        switch (c) {
+#if MSH_ENABLE_HISTORY
+        case 'A':
+            msh_history_browse(sh, 1);
+            return;
+        case 'B':
+            msh_history_browse(sh, -1);
+            return;
+#endif
+        case 'C':
+            if (sh->cursor < sh->length) {
+                sh->cursor++;
+                if (sh->echo) {
+                    msh_print_str(sh, "\033[C");
+                }
+            }
+            return;
+        case 'D':
+            if (sh->cursor > 0u) {
                 sh->cursor--;
-                sh_print(sh, "\033[D");
+                if (sh->echo) {
+                    msh_print_str(sh, "\033[D");
+                }
+            }
+            return;
+        case '~':
+            if (sh->csi_param == 3u) {
+                previous_length = sh->length;
+                if (msh_line_delete_forward(sh)) {
+                    msh_redraw_line(sh, previous_length);
+                }
             }
             return;
         default:
-            return;  /* ignore unknown sequences */
+            return;
         }
     }
 
-    /* ── Normal character handling ─────────────────────────────────────── */
+    if (c != MSH_KEY_LF) {
+        sh->saw_cr = false;
+    }
 
     switch (c) {
-    case KEY_ESC:
-        sh->esc_state = 1;
+    case MSH_KEY_ESC:
+        sh->esc_state = MSH_ESC_SEEN_ESC;
         return;
 
-    case KEY_ENTER:
-    case KEY_NEWLINE:
-        sh_print(sh, "\r\n");
-        sh->line[sh->length] = '\0';
+    case MSH_KEY_CR:
+        sh->saw_cr = true;
+        msh_handle_enter(sh);
+        return;
 
-#if MSH_ENABLE_HISTORY
-        history_push(sh, sh->line);
-        sh->hist_browse = 0;
-#endif
-
-        if (sh->length > 0) {
-            /* Copy line before execute (parse modifies it) */
-            char exec_line[MSH_LINE_SIZE];
-            memcpy(exec_line, sh->line, sh->length + 1);
-            line_clear(sh);
-
-            int result = execute(sh, exec_line);
-            if (result != 0 && result != MSH_ERR_NOT_FOUND) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "error: %d\r\n", result);
-                sh_print(sh, buf);
-            }
-        } else {
-            line_clear(sh);
+    case MSH_KEY_LF:
+        if (sh->saw_cr) {
+            sh->saw_cr = false;
+            return;
         }
-
-        msh_prompt(sh);
+        msh_handle_enter(sh);
         return;
 
-    case KEY_BACKSPACE:
-    case KEY_DEL:
-        if (sh->cursor > 0) {
-            line_delete_back(sh);
-            if (sh->echo) {
-                /* Redraw from cursor position */
-                sh_print(sh, "\b");
-                sh_print(sh, sh->line + sh->cursor);
-                sh_print(sh, " \b");
-                /* Move cursor back to position */
-                for (uint8_t i = sh->cursor; i < sh->length; i++) {
-                    sh_print(sh, "\b");
-                }
-            }
+    case MSH_KEY_BS:
+        previous_length = sh->length;
+        if (msh_line_delete_back(sh)) {
+            msh_redraw_line(sh, previous_length);
         }
         return;
 
-    case KEY_TAB:
+    case MSH_KEY_DEL:
+        previous_length = sh->length;
+        if (msh_line_delete_back(sh)) {
+            msh_redraw_line(sh, previous_length);
+        }
+        return;
+
+    case MSH_KEY_TAB:
 #if MSH_ENABLE_COMPLETE
-        tab_complete(sh);
+        msh_tab_complete(sh);
 #endif
         return;
 
     default:
-        /* Printable characters */
-        if (c >= ' ' && c <= '~') {
-            line_insert_char(sh, c);
-            if (sh->echo) {
-                if (sh->cursor == sh->length) {
-                    /* Simple append */
-                    sh_putc(sh, c);
-                } else {
-                    /* Inserted in middle — redraw from cursor */
-                    sh_print(sh, sh->line + sh->cursor - 1);
-                    for (uint8_t i = sh->cursor; i < sh->length; i++) {
-                        sh_print(sh, "\b");
-                    }
-                }
+        if ((byte >= 32u) && (byte <= 126u)) {
+            previous_length = sh->length;
+            if (msh_line_insert_char(sh, c)) {
+                msh_redraw_line(sh, previous_length);
             }
         }
         return;
@@ -454,23 +696,36 @@ void msh_feed(msh_t *sh, char c)
 
 int msh_exec(msh_t *sh, const char *line)
 {
-    if (sh == NULL || line == NULL) return MSH_ERR_NULL;
-
     char buf[MSH_LINE_SIZE];
-    strncpy(buf, line, MSH_LINE_SIZE - 1);
-    buf[MSH_LINE_SIZE - 1] = '\0';
+    size_t len;
+    msh_exec_result_t exec_result;
 
-    return execute(sh, buf);
+    if ((sh == NULL) || (line == NULL)) {
+        return MSH_ERR_NULL;
+    }
+
+    len = strlen(line);
+    if (len >= (size_t)MSH_LINE_SIZE) {
+        return MSH_ERR_INPUT_TOO_LONG;
+    }
+
+    memcpy(buf, line, len + 1u);
+    exec_result = msh_execute_line(sh, buf, true);
+    return exec_result.result;
 }
 
 uint8_t msh_command_count(const msh_t *sh)
 {
-    if (sh == NULL) return 0;
+    if (sh == NULL) {
+        return 0u;
+    }
     return sh->num_commands;
 }
 
 const msh_cmd_t *msh_command_at(const msh_t *sh, uint8_t index)
 {
-    if (sh == NULL || index >= sh->num_commands) return NULL;
+    if ((sh == NULL) || (index >= sh->num_commands)) {
+        return NULL;
+    }
     return &sh->commands[index];
 }
